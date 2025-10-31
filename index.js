@@ -137,6 +137,13 @@ app.get("/leaderboard", (req, res) => {
   const rows = topStmt.all(limit);
   return res.json({ top: rows });
 });
+// Health check + simple ping
+app.get("/", (req, res) => res.status(200).send("ok"));
+// Optional: basic error handler to avoid crashing on unexpected errors
+app.use((err, req, res, next) => {
+  console.error("Unhandled error:", err);
+  res.status(500).send("server error");
+});
 
 // Optional: publish/update a pinned leaderboard message in a channel
 let leaderboardMessageId = null;
