@@ -3,7 +3,7 @@ import { Client, GatewayIntentBits, Events } from "discord.js";
 const token = process.env.DISCORD_BOT_TOKEN;       // same bot as your interactions app
 const verifyChannelId = process.env.VERIFY_CHANNEL_ID; // #verify channel ID
 const welcomeMsg = process.env.WELCOME_MESSAGE
-  || "👋 Welcome, <@{USER_ID}>! Head to this channel and click **Verify as Creator** below to unlock access.";
+  || "👋 Welcome, <@{USER_ID}>! Hit the **Verify as Creator** button to unlock access.";
 
 if (!token || !verifyChannelId) {
   console.error("Missing DISCORD_BOT_TOKEN or VERIFY_CHANNEL_ID");
