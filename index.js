@@ -20,6 +20,7 @@ if (!TOKEN) {
 }
 
 /* ====== DB (sqlite) ====== */
+// If you add a Render Disk, change to: new Database("/data/vivital-xp.db");
 const db = new Database("vivital-xp.db");
 db.pragma("journal_mode = WAL");
 db.exec(`
@@ -65,19 +66,19 @@ client.login(TOKEN);
 
 /* ====== EXPRESS API ====== */
 const app = express();
-app.use(express.json({ type: "*/*" }));
+app.use(express.json({ type: "*/*" })); // default parser (except Shopify route)
 
-// health
+// Health check
 app.get("/", (_req, res) => res.status(200).send("ok"));
 
-// leaderboard JSON
+// Leaderboard JSON
 app.get("/leaderboard", (req, res) => {
   const limit = Math.min(parseInt(req.query.limit || "10", 10), 50);
   const rows = db.prepare(`SELECT discord_id, xp, orders FROM xp ORDER BY xp DESC, orders DESC LIMIT ?`).all(limit);
   res.json({ top: rows });
 });
 
-// secure helper
+// Helper to check shared secret
 function requireBearer(req, res) {
   const header = req.headers.authorization || "";
   const token = header.startsWith("Bearer ") ? header.slice(7) : "";
@@ -88,7 +89,7 @@ function requireBearer(req, res) {
   return true;
 }
 
-// map email -> discord (called by Vercel verify or manual)
+// Map email -> Discord (from Vercel)
 app.post("/map-email", (req, res) => {
   if (!requireBearer(req, res)) return;
   const { email, discordId, username } = req.body || {};
@@ -99,18 +100,30 @@ app.post("/map-email", (req, res) => {
   return res.json({ ok: true });
 });
 
-// Shopify webhook: orders paid -> add XP
-app.post("/webhook/orders-paid", (req, res) => {
+/* ====== SHOPIFY WEBHOOK (RAW BODY + HMAC) ====== */
+const shopifyRaw = express.raw({ type: "application/json" });
+app.post("/webhook/orders-paid", shopifyRaw, (req, res) => {
   try {
-    const raw = JSON.stringify(req.body);
-    const h = crypto.createHmac("sha256", SHOPIFY_WEBHOOK_SECRET).update(raw, "utf8").digest("base64");
-    const sig = req.headers["x-shopify-hmac-sha256"];
-    if (!SHOPIFY_WEBHOOK_SECRET || h !== sig) {
+    if (!SHOPIFY_WEBHOOK_SECRET) return res.status(401).send("missing secret");
+
+    // Compute HMAC over raw body bytes
+    const rawBody = req.body; // Buffer
+    const expected = req.headers["x-shopify-hmac-sha256"] || "";
+    const computed = crypto.createHmac("sha256", SHOPIFY_WEBHOOK_SECRET)
+      .update(rawBody)
+      .digest("base64");
+
+    const ok =
+      expected.length === computed.length &&
+      crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(computed));
+
+    if (!ok) {
       console.log("invalid hmac");
       return res.status(401).send("invalid hmac");
     }
 
-    const email = (req.body?.email || req.body?.customer?.email || "").toLowerCase().trim();
+    const payload = JSON.parse(rawBody.toString("utf8"));
+    const email = (payload?.email || payload?.customer?.email || "").toLowerCase().trim();
     if (!email) {
       console.log("no email; ignored");
       return res.status(200).send("ok");
@@ -127,7 +140,7 @@ app.post("/webhook/orders-paid", (req, res) => {
                   xp = xp + excluded.xp,
                   orders = orders + 1`).run(map.discord_id, XP_PER_ORDER);
 
-    console.log(`+${XP_PER_ORDER} XP to ${map.discord_id} for order ${req.body?.id || "n/a"}`);
+    console.log(`+${XP_PER_ORDER} XP to ${map.discord_id} for order ${payload?.id || "n/a"}`);
     res.status(200).send("ok");
   } catch (e) {
     console.error("orders-paid error:", e.message);
@@ -135,7 +148,7 @@ app.post("/webhook/orders-paid", (req, res) => {
   }
 });
 
-// publish (or refresh) a pinned leaderboard message in a channel
+/* ====== PUBLISH / REFRESH LEADERBOARD ====== */
 app.post("/leaderboard/publish", async (req, res) => {
   if (!requireBearer(req, res)) return;
   if (!LEADERBOARD_CHANNEL_ID) return res.status(400).json({ ok: false, error: "LEADERBOARD_CHANNEL_ID not set" });
@@ -148,7 +161,6 @@ app.post("/leaderboard/publish", async (req, res) => {
     const ch = await client.channels.fetch(LEADERBOARD_CHANNEL_ID).catch(() => null);
     if (!ch || !ch.send) return res.status(400).json({ ok: false, error: "channel not found or not text" });
 
-    // try to find an existing pinned message from this bot containing the header
     const pins = await ch.messages.fetchPinned().catch(() => null);
     const existing = pins?.find(m => m.author?.id === client.user.id && m.content?.startsWith("🏆 **Creator Leaderboard**"));
 
@@ -157,9 +169,7 @@ app.post("/leaderboard/publish", async (req, res) => {
       console.log("Leaderboard message updated");
     } else {
       const msg = await ch.send({ content });
-      // try pinning (requires Manage Messages)
       try { await msg.pin(); } catch {}
-      // unpin older bot leaderboard pins if multiple
       if (pins) {
         const others = pins.filter(m => m.id !== msg.id && m.author?.id === client.user.id && m.content?.startsWith("🏆 **Creator Leaderboard**"));
         for (const [,m] of others) { try { await m.unpin(); } catch {} }
@@ -174,7 +184,7 @@ app.post("/leaderboard/publish", async (req, res) => {
   }
 });
 
-// generic error handler
+// Fallback error handler
 app.use((err, _req, res, _next) => {
   console.error("Unhandled error:", err);
   res.status(500).send("server error");
@@ -182,7 +192,7 @@ app.use((err, _req, res, _next) => {
 
 app.listen(PORT, () => console.log(`API listening on :${PORT}`));
 
-// optional auto-refresh
+/* ====== OPTIONAL AUTO-REFRESH ====== */
 if (REFRESH_MINUTES > 0) {
   setInterval(async () => {
     try {
