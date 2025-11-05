@@ -7,9 +7,18 @@ import { Client, GatewayIntentBits, Events, PermissionFlagsBits } from "discord.
 const TOKEN = process.env.DISCORD_BOT_TOKEN;
 const VERIFY_CHANNEL_ID = process.env.VERIFY_CHANNEL_ID;
 const WELCOME_MESSAGE = process.env.WELCOME_MESSAGE || "👋 Welcome, <@{USER_ID}>! Click **Verify as Creator** to unlock access.";
+
 const SHOPIFY_WEBHOOK_SECRET = process.env.SHOPIFY_WEBHOOK_SECRET || "";
 const API_SHARED_SECRET = process.env.API_SHARED_SECRET || "";
-const XP_PER_ORDER = parseInt(process.env.XP_PER_ORDER || "10", 10);
+
+const XP_MODE = (process.env.XP_MODE || "hybrid").toLowerCase(); // hybrid|tiered|flat|revenue (we use hybrid)
+const XP_BASE = parseFloat(process.env.XP_BASE || "5");
+const XP_K    = parseFloat(process.env.XP_K || "2");
+const XP_CAP  = parseFloat(process.env.XP_CAP || "40");
+
+const XP_NEW_CUSTOMER_BONUS     = parseFloat(process.env.XP_NEW_CUSTOMER_BONUS || "5");
+const XP_FIRST_VERIFIED_BONUS   = parseFloat(process.env.XP_FIRST_VERIFIED_BONUS || "10");
+
 const LEADERBOARD_CHANNEL_ID = process.env.LEADERBOARD_CHANNEL_ID || "";
 const REFRESH_MINUTES = parseInt(process.env.REFRESH_MINUTES || "0", 10);
 const PORT = process.env.PORT || 10000;
@@ -17,7 +26,7 @@ const PORT = process.env.PORT || 10000;
 if (!TOKEN) { console.error("Missing DISCORD_BOT_TOKEN"); process.exit(1); }
 
 /* ===== DB (SQLite) ===== */
-// For persistence, attach a Render Disk and change to: new Database("/data/vivital-xp.db")
+// For persistence on Render Disk, change path to: "/data/vivital-xp.db"
 const db = new Database("vivital-xp.db");
 db.pragma("journal_mode = WAL");
 db.exec(`
@@ -26,10 +35,23 @@ CREATE TABLE IF NOT EXISTS email_map (
   discord_id TEXT NOT NULL,
   username TEXT
 );
+CREATE TABLE IF NOT EXISTS code_map (
+  code TEXT PRIMARY KEY,         -- affiliate/discount code (lowercase)
+  discord_id TEXT NOT NULL,
+  email TEXT,
+  username TEXT
+);
 CREATE TABLE IF NOT EXISTS xp (
   discord_id TEXT PRIMARY KEY,
   xp INTEGER NOT NULL DEFAULT 0,
   orders INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS order_xp (
+  order_id TEXT PRIMARY KEY,
+  discord_id TEXT NOT NULL,
+  xp_awarded INTEGER NOT NULL,
+  net_revenue REAL NOT NULL,
+  refunded_xp INTEGER NOT NULL DEFAULT 0
 );
 `);
 
@@ -56,40 +78,168 @@ const app = express();
 /* --- Health --- */
 app.get("/", (_req, res) => res.status(200).send("ok"));
 
-/* --- Shopify webhook must parse RAW body BEFORE any JSON middleware --- */
+/* ---------- WEBHOOK HELPERS ---------- */
 const shopifyRaw = express.raw({ type: "application/json" });
+
+function verifyShopifyHmac(req) {
+  if (!SHOPIFY_WEBHOOK_SECRET) return false;
+  const rawBody = req.body; // Buffer
+  const expected = req.headers["x-shopify-hmac-sha256"] || "";
+  const computed = crypto.createHmac("sha256", SHOPIFY_WEBHOOK_SECRET).update(rawBody).digest("base64");
+  return expected.length === computed.length && crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(computed));
+}
+
+function collectDiscountCodesFromOrder(order) {
+  const out = new Set();
+  const apps = order?.discount_applications || [];
+  for (const a of apps) {
+    if ((a?.type || "").toLowerCase() === "discount_code" && a?.code) out.add(String(a.code).toLowerCase());
+  }
+  const legacy = order?.discount_codes || [];
+  for (const d of legacy) {
+    if (d?.code) out.add(String(d.code).toLowerCase());
+  }
+  return Array.from(out);
+}
+
+function parseNumber(x) {
+  const n = typeof x === "number" ? x : parseFloat(String(x || "0"));
+  return Number.isFinite(n) ? n : 0;
+}
+
+function estimateNetRevenueFromOrder(order) {
+  // net ≈ subtotal_price - total_discounts (exclude shipping/tax)
+  const subtotal = parseNumber(order?.subtotal_price ?? order?.current_subtotal_price);
+  const discounts = parseNumber(order?.total_discounts ?? order?.current_total_discounts);
+  return Math.max(0, subtotal - discounts);
+}
+
+function estimateRefundNetFromRefund(refund) {
+  // Approx: sum(line_item.price * quantity) from refund_line_items
+  let sum = 0;
+  const items = refund?.refund_line_items || [];
+  for (const rli of items) {
+    const price = parseNumber(rli?.line_item?.price);
+    const qty = parseNumber(rli?.quantity);
+    sum += price * qty;
+  }
+  return Math.max(0, sum);
+}
+
+function calcHybridXP(net) {
+  const base = Math.max(0, XP_BASE);
+  const k    = Math.max(0, XP_K);
+  const cap  = Math.max(0, XP_CAP);
+  const raw  = base + k * Math.sqrt(Math.max(0, net));
+  return Math.min(Math.round(raw), cap || 1e9);
+}
+
+/* ---------- ORDERS PAID (AWARD) ---------- */
 app.post("/webhook/orders-paid", shopifyRaw, (req, res) => {
   try {
-    if (!SHOPIFY_WEBHOOK_SECRET) return res.status(401).send("missing secret");
+    if (!verifyShopifyHmac(req)) { console.log("invalid hmac (orders-paid)"); return res.status(401).send("invalid hmac"); }
+    const order = JSON.parse(req.body.toString("utf8"));
 
-    const rawBody = req.body; // Buffer
-    const expected = req.headers["x-shopify-hmac-sha256"] || "";
-    const computed = crypto.createHmac("sha256", SHOPIFY_WEBHOOK_SECRET).update(rawBody).digest("base64");
+    // 1) decide recipient by affiliate code (primary), fallback email
+    const codes = collectDiscountCodesFromOrder(order);
+    let discordId = null;
 
-    const ok = expected.length === computed.length &&
-      crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(computed));
-    if (!ok) { console.log("invalid hmac"); return res.status(401).send("invalid hmac"); }
+    for (const code of codes) {
+      const row = db.prepare(`SELECT discord_id FROM code_map WHERE code=?`).get(code.toLowerCase());
+      if (row?.discord_id) { discordId = row.discord_id; break; }
+    }
+    if (!discordId) {
+      const email = (order?.email || order?.customer?.email || "").toLowerCase().trim();
+      if (email) {
+        const map = db.prepare(`SELECT discord_id FROM email_map WHERE email=?`).get(email);
+        if (map?.discord_id) discordId = map.discord_id;
+      }
+    }
+    if (!discordId) {
+      console.log("No mapping for order", order?.id, "codes:", codes.join(", ") || "none");
+      return res.status(200).send("ok");
+    }
 
-    const payload = JSON.parse(rawBody.toString("utf8"));
-    const email = (payload?.email || payload?.customer?.email || "").toLowerCase().trim();
-    if (!email) { console.log("no email; ignored"); return res.status(200).send("ok"); }
+    // 2) compute net & base XP (hybrid)
+    const net = estimateNetRevenueFromOrder(order);
+    let xp = calcHybridXP(net);
 
-    const map = db.prepare(`SELECT discord_id FROM email_map WHERE email=?`).get(email);
-    if (!map?.discord_id) { console.log(`Order paid but no creator mapping for email ${email}`); return res.status(200).send("ok"); }
+    // 3) bonuses
+    const ordersCount = parseNumber(order?.customer?.orders_count); // Shopify customer counter
+    if (ordersCount === 1) {
+      xp += Math.round(Math.max(0, XP_NEW_CUSTOMER_BONUS));
+    }
+    // first verified sale bonus (if our DB says zero orders before this)
+    const existing = db.prepare(`SELECT orders FROM xp WHERE discord_id=?`).get(discordId);
+    if (!existing || parseNumber(existing.orders) === 0) {
+      xp += Math.round(Math.max(0, XP_FIRST_VERIFIED_BONUS));
+    }
 
+    // 4) write: xp tally & order ledger
     db.prepare(`INSERT INTO xp (discord_id, xp, orders) VALUES (?, ?, 1)
                 ON CONFLICT(discord_id) DO UPDATE SET xp = xp + excluded.xp, orders = orders + 1`)
-      .run(map.discord_id, XP_PER_ORDER);
+      .run(discordId, xp);
 
-    console.log(`+${XP_PER_ORDER} XP to ${map.discord_id} for order ${payload?.id || "n/a"}`);
+    db.prepare(`INSERT INTO order_xp (order_id, discord_id, xp_awarded, net_revenue)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(order_id) DO NOTHING`)
+      .run(String(order.id), discordId, xp, net);
+
+    console.log(`+${xp} XP to ${discordId} for order ${order?.id} (net≈£${net.toFixed(2)})`);
     return res.status(200).send("ok");
   } catch (e) {
-    console.error("orders-paid error:", e.message);
+    console.error("orders-paid error:", e);
     return res.status(500).send("error");
   }
 });
 
-/* --- JSON middleware for all OTHER routes (after webhook) --- */
+/* ---------- REFUNDS CREATE (CLAWBACK) ---------- */
+app.post("/webhook/refunds-create", shopifyRaw, (req, res) => {
+  try {
+    if (!verifyShopifyHmac(req)) { console.log("invalid hmac (refunds-create)"); return res.status(401).send("invalid hmac"); }
+    const refund = JSON.parse(req.body.toString("utf8"));
+
+    const orderId = String(refund?.order_id || "");
+    if (!orderId) return res.status(200).send("ok");
+
+    const ledger = db.prepare(`SELECT order_id, discord_id, xp_awarded, net_revenue, refunded_xp FROM order_xp WHERE order_id=?`).get(orderId);
+    if (!ledger) {
+      console.log("refund for unknown order ledger", orderId);
+      return res.status(200).send("ok");
+    }
+    const { discord_id, xp_awarded, net_revenue, refunded_xp } = ledger;
+
+    const refundNet = estimateRefundNetFromRefund(refund);
+    if (refundNet <= 0 || net_revenue <= 0) {
+      console.log("refund has zero net, skipping", orderId);
+      return res.status(200).send("ok");
+    }
+
+    // prorated clawback
+    const ratio = Math.min(1, refundNet / net_revenue);
+    const xpToClaw = Math.round(xp_awarded * ratio);
+
+    // avoid double-clawback: subtract only the remaining portion
+    const remaining = Math.max(0, xp_awarded - refunded_xp);
+    const delta = Math.min(remaining, xpToClaw);
+    if (delta <= 0) {
+      console.log("refund already fully clawed for", orderId);
+      return res.status(200).send("ok");
+    }
+
+    // apply clawback
+    db.prepare(`UPDATE xp SET xp = MAX(0, xp - ?) WHERE discord_id=?`).run(delta, discord_id);
+    db.prepare(`UPDATE order_xp SET refunded_xp = refunded_xp + ? WHERE order_id=?`).run(delta, orderId);
+
+    console.log(`- ${delta} XP clawed back from ${discord_id} for refund on order ${orderId} (ratio ${(ratio*100).toFixed(1)}%)`);
+    return res.status(200).send("ok");
+  } catch (e) {
+    console.error("refunds-create error:", e);
+    return res.status(500).send("error");
+  }
+});
+
+/* ---------- JSON middleware for NON-webhook routes ---------- */
 app.use(express.json());
 
 /* --- Leaderboard JSON --- */
@@ -99,7 +249,7 @@ app.get("/leaderboard", (req, res) => {
   res.json({ top: rows });
 });
 
-/* --- Shared-secret guard --- */
+/* --- Auth helper --- */
 function requireBearer(req, res) {
   const header = req.headers.authorization || "";
   const token = header.startsWith("Bearer ") ? header.slice(7) : "";
@@ -110,7 +260,7 @@ function requireBearer(req, res) {
   return true;
 }
 
-/* --- Map email -> Discord (from Vercel or manual) --- */
+/* --- Map email -> Discord (kept as fallback) --- */
 app.post("/map-email", (req, res) => {
   if (!requireBearer(req, res)) return;
   const { email, discordId, username } = req.body || {};
@@ -118,6 +268,17 @@ app.post("/map-email", (req, res) => {
   db.prepare(`INSERT INTO email_map (email, discord_id, username) VALUES (?, ?, ?)
               ON CONFLICT(email) DO UPDATE SET discord_id=excluded.discord_id, username=excluded.username`)
     .run(String(email).toLowerCase().trim(), String(discordId), username || null);
+  return res.json({ ok: true });
+});
+
+/* --- Map affiliate code -> Discord (primary) --- */
+app.post("/map-code", (req, res) => {
+  if (!requireBearer(req, res)) return;
+  const { code, discordId, email, username } = req.body || {};
+  if (!code || !discordId) return res.status(400).json({ ok: false, error: "missing code/discordId" });
+  db.prepare(`INSERT INTO code_map (code, discord_id, email, username) VALUES (?, ?, ?, ?)
+              ON CONFLICT(code) DO UPDATE SET discord_id=excluded.discord_id, email=COALESCE(excluded.email, code_map.email), username=COALESCE(excluded.username, code_map.username)`)
+    .run(String(code).toLowerCase().trim(), String(discordId), email || null, username || null);
   return res.json({ ok: true });
 });
 
